@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#081b2d" />
+    <title>Data Detective: Outbreak</title>
+    <meta name="description" content="A cooperative multiplayer investigation game where every player holds a piece of the truth." />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23081b2d'/%3E%3Ccircle cx='16' cy='16' r='8' fill='%239cf7d3'/%3E%3Cpath d='M16 10v12M10 16h12' stroke='%23081b2d' stroke-width='2'/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Outfit:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+    <main class="app-shell">
+      <header class="site-header">
+        <a class="brand" href="#" aria-label="Data Detective home">
+          <span class="brand-mark">DD</span>
+          <span>DATA DETECTIVE <em>OUTBREAK</em></span>
+        </a>
+        <p class="fictional-notice">Fictional investigation game · Not health guidance</p>
+      </header>
+
+      <section id="landing" class="screen landing-screen">
+        <div class="hero-copy">
+          <p class="eyebrow">CASE FILE 01 · DISTRICT 7</p>
+          <h1>Every clue has an owner.<br /><span>Every decision has a cost.</span></h1>
+          <p class="hero-text">
+            A cooperative multiplayer investigation for teams that think out loud. Compare private evidence,
+            test your theory, and contain a fictional outbreak before the city loses trust.
+          </p>
+          <div class="hero-actions">
+            <button class="button button-primary" id="host-case">Host a case <span>→</span></button>
+            <form id="join-form" class="join-form">
+              <input id="join-code" aria-label="Room code" autocomplete="off" maxlength="7" placeholder="Room code" />
+              <button class="button button-secondary" type="submit">Join case</button>
+            </form>
+          </div>
+          <button class="text-button how-link" id="how-to-play">How it works</button>
+          <div class="score-pill-row" aria-label="Game principles">
+            <span>PRIVATE EVIDENCE</span><span>SHARED DECISIONS</span><span>ONE FINAL CALL</span>
+          </div>
+        </div>
+        <aside class="case-preview" aria-label="Case file preview">
+          <div class="case-preview-top"><span>ACTIVE CASE</span><span class="pulse">● LIVE</span></div>
+          <p class="case-number">D7-09</p>
+          <h2>The District 7 surge</h2>
+          <div class="preview-stat-grid">
+            <div><strong>4</strong><span>specialist roles</span></div>
+            <div><strong>3</strong><span>decision rounds</span></div>
+            <div><strong>1</strong><span>shared outcome</span></div>
+          </div>
+          <div class="map-fragment" aria-hidden="true">
+            <span class="map-dot dot-a"></span><span class="map-dot dot-b"></span><span class="map-dot dot-c"></span>
+            <i></i><b></b><small>CLUSTER D7</small>
+          </div>
+        </aside>
+      </section>
+
+      <section id="lobby" class="screen panel-screen hidden" aria-live="polite">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">ASSEMBLE THE TEAM</p>
+            <h1>Choose your lens.</h1>
+          </div>
+          <button class="text-button" data-action="return-home">← Back home</button>
+        </div>
+        <div class="room-banner">
+          <div><span>ROOM CODE</span><strong id="room-code">D7-0000</strong></div>
+          <p>Open this game in another tab, choose the same code, and select a different role.</p>
+          <button class="button button-small" id="copy-room">Copy code</button>
+        </div>
+        <div class="lobby-layout">
+          <div>
+            <p class="section-label">SELECT A ROLE</p>
+            <div id="role-grid" class="role-grid"></div>
+          </div>
+          <aside class="mission-card">
+            <span class="mission-icon">✦</span>
+            <p class="section-label">YOUR MISSION</p>
+            <h2>Find the shared pattern.</h2>
+            <p>Your team gets one move per round. Share what only you can see, then decide what to investigate.</p>
+            <div id="team-status" class="team-status"></div>
+            <button class="button button-primary wide" id="start-case" disabled>Begin investigation <span>→</span></button>
+          </aside>
+        </div>
+      </section>
+
+      <section id="game" class="screen game-screen hidden" aria-live="polite">
+        <div class="game-topbar">
+          <div class="case-heading"><span class="case-indicator"></span><div><p>CASE D7-09</p><h1>The District 7 surge</h1></div></div>
+          <div class="round-status"><span id="round-label">ROUND 1 OF 3</span><strong id="clock-label">08:00</strong></div>
+          <div class="resource-display"><div><span>TIME</span><strong id="time-value">6</strong></div><div><span>TRUST</span><strong id="trust-value">4</strong></div></div>
+        </div>
+
+        <div class="briefing-strip">
+          <div class="briefing-icon">!</div>
+          <p><strong>Situation:</strong> 26 residents reported severe symptoms after the Riverlight Festival. Hospitals are busy, social feeds are speculating, and the source is unknown.</p>
+          <button class="text-button" id="open-objective">Case objective</button>
+        </div>
+
+        <div class="game-grid">
+          <section class="private-dossier">
+            <div class="panel-heading"><div><p class="section-label">PRIVATE DOSSIER</p><h2 id="role-title">Select a role</h2></div><span id="role-chip" class="role-chip">—</span></div>
+            <p id="role-instruction" class="role-instruction">Your role-specific evidence will appear here.</p>
+            <div id="private-evidence" class="evidence-stack"></div>
+          </section>
+
+          <section class="investigation-panel">
+            <div class="panel-heading"><div><p class="section-label">TEAM INVESTIGATION</p><h2>Choose one move</h2></div><span id="action-state" class="action-state">Awaiting team</span></div>
+            <p class="action-help">A move changes the case. Discuss first—your team only has three.</p>
+            <div id="action-grid" class="action-grid"></div>
+            <div id="event-card" class="event-card hidden"></div>
+          </section>
+
+          <section class="shared-board">
+            <div class="panel-heading"><div><p class="section-label">SHARED INTEL BOARD</p><h2>What the team knows</h2></div><span id="intel-count" class="intel-count">0 intel</span></div>
+            <div id="shared-evidence" class="shared-evidence empty-board"><p>No intel has been shared yet. Reveal the clues your team needs.</p></div>
+            <div class="hypothesis-wrap">
+              <label for="hypothesis">Working theory</label>
+              <input id="hypothesis" maxlength="140" placeholder="Type the team’s current theory…" />
+              <button id="save-hypothesis" class="text-button">Save theory</button>
+            </div>
+          </section>
+        </div>
+
+        <div class="game-footer">
+          <p id="footer-message">Share evidence and choose your first move.</p>
+          <button id="open-final" class="button button-primary" disabled>Make final call <span>→</span></button>
+        </div>
+      </section>
+
+      <section id="final" class="screen final-screen hidden">
+        <div class="final-copy"><p class="eyebrow">FINAL DECISION</p><h1>Contain the surge.</h1><p>Use what the team uncovered. One incorrect assumption can send resources in the wrong direction.</p></div>
+        <form id="final-form" class="final-form">
+          <label>What is the most likely source?<select name="source" required><option value="">Choose a source</option><option value="food">Food from the festival</option><option value="water">The District 7 water network</option><option value="air">Airborne exposure at the festival</option><option value="hospital">A hospital-origin outbreak</option></select></label>
+          <label>What pattern best explains the cases?<select name="pattern" required><option value="">Choose a pattern</option><option value="common">A common exposure at one site</option><option value="person">Rapid person-to-person spread</option><option value="citywide">A citywide infrastructure failure</option><option value="unknown">No connection between cases</option></select></label>
+          <label>Which response should happen first?<select name="response" required><option value="">Choose a response</option><option value="close">Close Food Lane C and issue a targeted advisory</option><option value="water">Shut down the water network citywide</option><option value="festival">Cancel every city event for a month</option><option value="hospital">Send all patients to one hospital</option></select></label>
+          <button class="button button-primary wide" type="submit">Submit team decision <span>→</span></button>
+        </form>
+      </section>
+
+      <section id="result" class="screen result-screen hidden">
+        <p class="eyebrow">CASE RESOLVED</p>
+        <h1 id="result-title">A careful containment.</h1>
+        <p id="result-summary" class="result-summary"></p>
+        <div id="score-breakdown" class="score-breakdown"></div>
+        <div class="debrief-card"><p class="section-label">DEBRIEF</p><p id="debrief-text"></p></div>
+        <button id="play-again" class="button button-primary">Run the case again <span>↻</span></button>
+      </section>
+    </main>
+
+    <dialog id="how-dialog" class="modal"><button class="modal-close" data-close-dialog="how-dialog">×</button><p class="eyebrow">HOW TO PLAY</p><h2>Everyone sees part of the picture.</h2><ol><li>Join a room in separate browser tabs and take different roles.</li><li>Read your private clues. Reveal the details worth sharing.</li><li>Agree on three investigation moves, then make one final call.</li></ol></dialog>
+    <dialog id="objective-dialog" class="modal"><button class="modal-close" data-close-dialog="objective-dialog">×</button><p class="eyebrow">CASE OBJECTIVE</p><h2>Prevent a larger surge.</h2><p>Correctly identify the source and case pattern, then select the most proportional first response. High trust and unused time improve the final score.</p></dialog>
+    <script src="app.js"></script>
+  </body>
+</html>
+
