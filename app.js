@@ -1,4 +1,20 @@
-/* Data Detective: Outbreak - a local, multi-tab cooperative prototype. */
+/*
+ * Data Detective: Outbreak
+ * Cross-device room sync is powered by Firebase Realtime Database.
+ */
+
+import { firebaseConfig, firebaseConfigured } from "./firebase-config.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
+import {
+  getDatabase,
+  get,
+  onDisconnect,
+  onValue,
+  ref,
+  remove,
+  runTransaction
+} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js";
 
 const ROLES = [
   {
@@ -8,7 +24,7 @@ const ROLES = [
     summary: "Reads patient timelines and symptom patterns.",
     focus: "CASE TIMELINES",
     evidence: [
-      { id: "epi-1", title: "A narrow window", detail: "21 of 26 patients became ill 4–10 hours after visiting Riverlight Festival. The clustered timing points to a shared exposure.", key: true },
+      { id: "epi-1", title: "A narrow window", detail: "21 of 26 patients became ill 4-10 hours after visiting Riverlight Festival. The clustered timing points to a shared exposure.", key: true },
       { id: "epi-2", title: "No household chain", detail: "Follow-up reports show no meaningful rise among household contacts who skipped the festival.", key: true },
       { id: "epi-3", title: "A common stop", detail: "Most detailed interviews mention a stop near Food Lane C, but memories differ on the exact vendor.", key: true }
     ]
@@ -58,19 +74,38 @@ const ACTIONS = [
   { id: "water", icon: "≈", name: "Shut down water service", cost: 2, trust: -2, reveal: "The costly shutdown disrupts residents, while the case pattern still does not match a water-network issue." }
 ];
 
-const STORAGE_PREFIX = "data-detective-outbreak:";
-let playerId = sessionStorage.getItem("dd-player-id");
-if (!playerId) {
-  playerId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
-  sessionStorage.setItem("dd-player-id", playerId);
-}
-
-let roomCode = sessionStorage.getItem("dd-room-code") || "";
-let selectedRole = sessionStorage.getItem("dd-role") || "";
-let channel;
-
+const SESSION_ROOM_KEY = "dd-room-code";
+const SESSION_ROLE_KEY = "dd-role";
+const ROOM_PREFIX = "rooms/";
+const ROOM_CODE_PATTERN = /^D7-[A-Z0-9]{6}$/;
 const $ = (selector) => document.querySelector(selector);
 const screens = ["landing", "lobby", "game", "final", "result"];
+
+let app;
+let auth;
+let database;
+let playerId = "";
+const savedRoomCode = normalizeRoomCode(sessionStorage.getItem(SESSION_ROOM_KEY));
+const savedRole = sessionStorage.getItem(SESSION_ROLE_KEY) || "";
+if (!savedRoomCode) {
+  sessionStorage.removeItem(SESSION_ROOM_KEY);
+  sessionStorage.removeItem(SESSION_ROLE_KEY);
+}
+if (savedRoomCode && !ROLES.some((role) => role.id === savedRole)) {
+  sessionStorage.removeItem(SESSION_ROLE_KEY);
+}
+let roomCode = savedRoomCode;
+let selectedRole = savedRoomCode && ROLES.some((role) => role.id === savedRole) ? savedRole : "";
+let roomRef;
+let playerRef;
+let disconnectTask;
+let stopRoomListener;
+let stopConnectionListener;
+let roomState;
+let backendReady = false;
+let startupPromise;
+let wasConnected = false;
+let reconnectInProgress = false;
 
 function initialState() {
   return {
@@ -88,91 +123,335 @@ function initialState() {
   };
 }
 
-function stateKey() { return `${STORAGE_PREFIX}${roomCode}`; }
-function readState() {
-  if (!roomCode) return initialState();
-  try { return JSON.parse(localStorage.getItem(stateKey())) || initialState(); } catch { return initialState(); }
+function normalizeState(value) {
+  const base = initialState();
+  const next = Object.assign(base, value || {});
+  next.players = (value && value.players) || {};
+  next.actions = Array.isArray(value && value.actions) ? value.actions : [];
+  next.sharedEvidence = Array.isArray(value && value.sharedEvidence) ? value.sharedEvidence : [];
+  next.hypothesis = (value && value.hypothesis) || "";
+  next.lastEvent = (value && value.lastEvent) || "";
+  return next;
 }
-function writeState(next) {
-  next.updatedAt = Date.now();
-  localStorage.setItem(stateKey(), JSON.stringify(next));
-  if (channel) channel.postMessage({ type: "sync" });
+
+function stateForRender() {
+  return roomState || initialState();
+}
+
+function roomPath(code) {
+  return ROOM_PREFIX + code;
+}
+
+function normalizeRoomCode(value) {
+  const code = String(value || "").trim().toUpperCase();
+  return ROOM_CODE_PATTERN.test(code) ? code : "";
+}
+
+function inviteLink() {
+  const url = new URL(window.location.href);
+  url.searchParams.set("room", roomCode);
+  return url.toString();
+}
+
+function currentPlayer(state = stateForRender()) {
+  return playerId ? state.players[playerId] : undefined;
+}
+
+function chosenRole(state = stateForRender()) {
+  const player = currentPlayer(state);
+  return ROLES.find((role) => role.id === (player && player.roleId));
+}
+
+function roleName(roleId) {
+  const role = ROLES.find((item) => item.id === roleId);
+  return role ? role.name : "Specialist";
+}
+
+function showScreen(id) {
+  screens.forEach((screen) => $("#" + screen).classList.toggle("hidden", screen !== id));
+}
+
+function setBackendMessage(message, state = "") {
+  const element = $("#backend-message");
+  element.textContent = message;
+  element.dataset.state = state;
+}
+
+function makeRoomCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const values = new Uint32Array(6);
+  if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(values);
+  let suffix = "";
+  for (let index = 0; index < 6; index += 1) {
+    const value = values[index] || Math.floor(Math.random() * alphabet.length);
+    suffix += alphabet[value % alphabet.length];
+  }
+  return "D7-" + suffix;
+}
+
+async function initialiseBackend() {
+  if (!firebaseConfigured) {
+    setBackendMessage("Online rooms will be ready after the Firebase game service is connected.", "pending");
+    render();
+    return false;
+  }
+
+  try {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    database = getDatabase(app);
+    const credential = await signInAnonymously(auth);
+    playerId = credential.user.uid;
+    backendReady = true;
+    setBackendMessage("Online rooms connected. Invite teammates from any device.", "ready");
+
+    if (roomCode) {
+      try {
+        await connectToRoom(roomCode, selectedRole);
+      } catch (error) {
+        console.warn(error);
+        await leaveRoom();
+        setBackendMessage("Your previous case is no longer available. Host a new case or join a teammate.", "pending");
+        render();
+      }
+    } else {
+      render();
+    }
+    return true;
+  } catch (error) {
+    console.error(error);
+    setBackendMessage("The online game service could not connect. Check the Firebase setup and try again.", "error");
+    render();
+    return false;
+  }
+}
+
+async function ensureBackend() {
+  if (!startupPromise) startupPromise = initialiseBackend();
+  await startupPromise;
+  return backendReady;
+}
+
+async function createRoom() {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const code = makeRoomCode();
+    const candidateRef = ref(database, roomPath(code));
+    const result = await runTransaction(candidateRef, (existing) => {
+      if (existing !== null) return;
+      return initialState();
+    });
+    if (result.committed) return code;
+  }
+  throw new Error("Could not create a unique room.");
+}
+
+async function connectToRoom(code, roleToRestore = "") {
+  if (stopRoomListener) stopRoomListener();
+  if (stopConnectionListener) stopConnectionListener();
+  if (disconnectTask) await disconnectTask.cancel();
+  playerRef = undefined;
+  disconnectTask = undefined;
+  wasConnected = false;
+
+  roomCode = code;
+  roomRef = ref(database, roomPath(roomCode));
+  sessionStorage.setItem(SESSION_ROOM_KEY, roomCode);
+
+  const roomSnapshot = await get(roomRef);
+  if (!roomSnapshot.exists()) {
+    throw new Error("That room no longer exists.");
+  }
+
+  roomState = normalizeState(roomSnapshot.val());
+  stopRoomListener = onValue(
+    roomRef,
+    (snapshot) => {
+      roomState = snapshot.exists() ? normalizeState(snapshot.val()) : undefined;
+      if (!roomState) {
+        setBackendMessage("This room is no longer available. Host a new case to continue.", "error");
+        roomCode = "";
+        selectedRole = "";
+        sessionStorage.removeItem(SESSION_ROOM_KEY);
+        sessionStorage.removeItem(SESSION_ROLE_KEY);
+      }
+      render();
+    },
+    (error) => {
+      console.error(error);
+      setBackendMessage("The room connection was interrupted. Refresh to reconnect.", "error");
+    }
+  );
+
+  if (roleToRestore) {
+    const restored = await claimRole(roleToRestore, true);
+    if (!restored) {
+      selectedRole = "";
+      sessionStorage.removeItem(SESSION_ROLE_KEY);
+    }
+  }
+  watchConnection();
   render();
 }
-function updateState(mutator) {
-  const next = readState();
-  mutator(next);
-  writeState(next);
-}
-function makeRoomCode() { return `D7-${Math.floor(1000 + Math.random() * 9000)}`; }
-function showScreen(id) {
-  screens.forEach((screen) => $(`#${screen}`).classList.toggle("hidden", screen !== id));
-}
-function currentPlayer(state = readState()) { return state.players[playerId]; }
-function chosenRole() { return ROLES.find((role) => role.id === selectedRole); }
-function roleName(roleId) { return ROLES.find((role) => role.id === roleId)?.name || "Specialist"; }
 
-function joinRoom(code, roleId) {
-  roomCode = code;
-  selectedRole = roleId;
-  sessionStorage.setItem("dd-room-code", roomCode);
-  sessionStorage.setItem("dd-role", selectedRole);
-  if (channel) channel.close();
-  channel = new BroadcastChannel(`${STORAGE_PREFIX}${roomCode}`);
-  channel.onmessage = () => render();
-  updateState((state) => {
-    if (roleId) state.players[playerId] = { roleId, joinedAt: Date.now() };
-    else delete state.players[playerId];
+async function attachPresence() {
+  if (!roomCode || !playerId) return;
+  playerRef = ref(database, roomPath(roomCode) + "/players/" + playerId);
+  disconnectTask = onDisconnect(playerRef);
+  await disconnectTask.remove();
+}
+
+function watchConnection() {
+  if (stopConnectionListener) stopConnectionListener();
+  const connectionRef = ref(database, ".info/connected");
+  stopConnectionListener = onValue(connectionRef, (snapshot) => {
+    if (!snapshot.val()) {
+      wasConnected = false;
+      return;
+    }
+
+    const reconnecting = wasConnected;
+    wasConnected = true;
+    void handleConnection(reconnecting);
   });
 }
 
-function leaveRoom() {
-  if (roomCode) {
-    updateState((state) => { delete state.players[playerId]; });
+async function handleConnection(reconnecting) {
+  if (!roomRef || !playerId) return;
+
+  try {
+    await attachPresence();
+    if (!reconnecting || !selectedRole || reconnectInProgress) return;
+
+    reconnectInProgress = true;
+    const restored = await claimRole(selectedRole, true);
+    if (!restored) {
+      selectedRole = "";
+      sessionStorage.removeItem(SESSION_ROLE_KEY);
+    }
+  } catch (error) {
+    console.warn(error);
+  } finally {
+    reconnectInProgress = false;
   }
-  if (channel) channel.close();
-  channel = undefined;
+}
+
+async function claimRole(roleId, restoring = false) {
+  if (!backendReady || !roomRef || !playerId) return false;
+  let roleClaimed = false;
+
+  try {
+    // Queue cleanup before the role is written, then re-arm it after reconnects.
+    await attachPresence();
+    const result = await runTransaction(roomRef, (current) => {
+      if (!current) return;
+      const next = normalizeState(current);
+      const currentPlayer = next.players[playerId];
+      if (next.status !== "lobby") {
+        if (restoring && currentPlayer && currentPlayer.roleId === roleId) {
+          roleClaimed = true;
+          return next;
+        }
+        if (!(restoring && !currentPlayer)) return;
+      }
+      const occupied = Object.entries(next.players).some(([id, player]) => id !== playerId && player.roleId === roleId);
+      if (occupied) return;
+
+      next.players[playerId] = { roleId, joinedAt: Date.now() };
+      next.updatedAt = Date.now();
+      roleClaimed = true;
+      return next;
+    });
+
+    if (!result.committed || !roleClaimed) {
+      if (!restoring) setBackendMessage("That role was just claimed by another teammate. Choose another lens.", "error");
+      return false;
+    }
+
+    selectedRole = roleId;
+    sessionStorage.setItem(SESSION_ROLE_KEY, selectedRole);
+    return true;
+  } catch (error) {
+    console.error(error);
+    setBackendMessage("We could not save that role selection. Try again.", "error");
+    return false;
+  }
+}
+
+async function leaveRoom() {
+  if (playerRef) {
+    try {
+      await remove(playerRef);
+      if (disconnectTask) await disconnectTask.cancel();
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+  if (stopRoomListener) stopRoomListener();
+  if (stopConnectionListener) stopConnectionListener();
+
+  roomRef = undefined;
+  playerRef = undefined;
+  disconnectTask = undefined;
+  stopRoomListener = undefined;
+  stopConnectionListener = undefined;
+  roomState = undefined;
   roomCode = "";
   selectedRole = "";
-  sessionStorage.removeItem("dd-room-code");
-  sessionStorage.removeItem("dd-role");
+  wasConnected = false;
+  reconnectInProgress = false;
+  sessionStorage.removeItem(SESSION_ROOM_KEY);
+  sessionStorage.removeItem(SESSION_ROLE_KEY);
+}
+
+async function updateState(mutator) {
+  if (!backendReady || !roomRef) return false;
+
+  try {
+    const result = await runTransaction(roomRef, (current) => {
+      if (!current) return;
+      const next = normalizeState(current);
+      if (mutator(next) === false) return;
+      next.updatedAt = Date.now();
+      return next;
+    });
+    return result.committed;
+  } catch (error) {
+    console.error(error);
+    setBackendMessage("The room could not save that change. Check your connection and try again.", "error");
+    return false;
+  }
 }
 
 function renderRoles(state) {
   const activeRoles = new Map(Object.entries(state.players).map(([id, player]) => [player.roleId, id]));
+  const mine = currentPlayer(state);
+
   $("#role-grid").innerHTML = ROLES.map((role) => {
     const owner = activeRoles.get(role.id);
     const unavailable = owner && owner !== playerId;
-    const mine = role.id === selectedRole;
-    return `<button class="role-card ${mine ? "selected" : ""}" data-role="${role.id}" ${unavailable ? "disabled" : ""}>
-      <div class="role-card-top"><span class="role-icon">${role.icon}</span><small>${unavailable ? "IN USE" : mine ? "SELECTED" : role.focus}</small></div>
-      <h3>${role.name}</h3><p>${role.summary}</p>
-    </button>`;
+    const selected = mine && mine.roleId === role.id;
+    return '<button class="role-card ' + (selected ? "selected" : "") + '" data-role="' + role.id + '" ' + (unavailable ? "disabled" : "") + '>' +
+      '<div class="role-card-top"><span class="role-icon">' + role.icon + '</span><small>' + (unavailable ? "IN USE" : selected ? "SELECTED" : role.focus) + '</small></div>' +
+      "<h3>" + role.name + "</h3><p>" + role.summary + "</p></button>";
   }).join("");
+
   document.querySelectorAll("[data-role]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const roleId = button.dataset.role;
-      const previous = selectedRole;
-      selectedRole = roleId;
-      sessionStorage.setItem("dd-role", roleId);
-      updateState((next) => {
-        if (previous && next.players[playerId]?.roleId === previous) delete next.players[playerId];
-        next.players[playerId] = { roleId, joinedAt: Date.now() };
-      });
-      render();
+    button.addEventListener("click", async () => {
+      await claimRole(button.dataset.role);
     });
   });
 }
 
 function renderLobby(state) {
-  $("#room-code").textContent = roomCode || "D7-0000";
+  $("#room-code").textContent = roomCode || "D7-ABC123";
   renderRoles(state);
   const players = Object.values(state.players).filter((player) => ROLES.some((role) => role.id === player.roleId));
   $("#team-status").innerHTML = players.length
-    ? players.map((player) => `<span class="team-member"><i></i>${roleName(player.roleId)}</span>`).join("")
-    : "<span class=\"team-member\">Choose a role to join this room.</span>";
+    ? players.map((player) => '<span class="team-member"><i></i>' + roleName(player.roleId) + "</span>").join("")
+    : '<span class="team-member">Choose a role to join this room.</span>';
+
   const start = $("#start-case");
-  start.disabled = !selectedRole || players.length < 2;
+  start.disabled = !currentPlayer(state) || players.length < 2;
   start.textContent = players.length < 2 ? "Need at least 2 players" : "Begin investigation →";
 }
 
@@ -182,28 +461,37 @@ function renderPrivateEvidence(state, role) {
   $("#role-instruction").textContent = role
     ? "Tap a clue to reveal it to your team. Your teammates cannot see it until you share it."
     : "Choose a role in the lobby to access your private evidence.";
+
   $("#private-evidence").innerHTML = role ? role.evidence.map((item, index) => {
     const revealed = state.sharedEvidence.includes(item.id);
-    return `<article class="evidence-card ${revealed ? "revealed" : ""}"><button data-evidence="${item.id}" ${revealed ? "disabled" : ""}>
-      <span class="evidence-number">${revealed ? "✓" : index + 1}</span><strong>${item.title}</strong><span aria-hidden="true">${revealed ? "" : "+"}</span>
-    </button><p class="evidence-detail">${item.detail}</p></article>`;
+    return '<article class="evidence-card ' + (revealed ? "revealed" : "") + '"><button data-evidence="' + item.id + '" ' + (revealed ? "disabled" : "") + ">" +
+      '<span class="evidence-number">' + (revealed ? "✓" : index + 1) + "</span><strong>" + item.title + '</strong><span aria-hidden="true">' + (revealed ? "" : "+") + "</span></button>" +
+      '<p class="evidence-detail">' + item.detail + "</p></article>";
   }).join("") : "";
-  document.querySelectorAll("[data-evidence]").forEach((button) => button.addEventListener("click", () => shareEvidence(button.dataset.evidence)));
+
+  document.querySelectorAll("[data-evidence]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const saved = await updateState((next) => {
+        if (next.sharedEvidence.includes(button.dataset.evidence)) return false;
+        next.sharedEvidence.push(button.dataset.evidence);
+      });
+      if (!saved) setBackendMessage("That clue was already shared by your team.", "pending");
+    });
+  });
 }
 
-function allEvidence() { return ROLES.flatMap((role) => role.evidence.map((item) => ({ ...item, role: role.name }))); }
-function shareEvidence(evidenceId) {
-  updateState((state) => {
-    if (!state.sharedEvidence.includes(evidenceId)) state.sharedEvidence.push(evidenceId);
-  });
+function allEvidence() {
+  return ROLES.flatMap((role) => role.evidence.map((item) => Object.assign({}, item, { role: role.name })));
 }
 
 function renderSharedBoard(state) {
   const evidence = allEvidence().filter((item) => state.sharedEvidence.includes(item.id));
-  $("#intel-count").textContent = `${evidence.length} intel`;
+  $("#intel-count").textContent = evidence.length + " intel";
   const board = $("#shared-evidence");
   board.classList.toggle("empty-board", evidence.length === 0);
-  board.innerHTML = evidence.length ? evidence.map((item) => `<article class="shared-item"><span>${item.role.toUpperCase()}</span><strong>${item.title}</strong><p>${item.detail}</p></article>`).join("") : "<p>No intel has been shared yet. Reveal the clues your team needs.</p>";
+  board.innerHTML = evidence.length
+    ? evidence.map((item) => '<article class="shared-item"><span>' + item.role.toUpperCase() + "</span><strong>" + item.title + "</strong><p>" + item.detail + "</p></article>").join("")
+    : "<p>No intel has been shared yet. Reveal the clues your team needs.</p>";
   $("#hypothesis").value = state.hypothesis || "";
 }
 
@@ -213,44 +501,52 @@ function renderActions(state) {
   $("#action-grid").innerHTML = ACTIONS.map((action) => {
     const used = state.actions.includes(action.id);
     const cannotAfford = state.time < action.cost;
-    return `<button class="action-button" data-action-id="${action.id}" ${!actionIsAvailable || used || cannotAfford ? "disabled" : ""}>
-      <i>${action.icon}</i><strong>${action.name}</strong><small>${used ? "DONE" : `${action.cost} TIME`}</small></button>`;
+    const disabled = !actionIsAvailable || used || cannotAfford;
+    return '<button class="action-button" data-action-id="' + action.id + '" ' + (disabled ? "disabled" : "") + ">" +
+      "<i>" + action.icon + "</i><strong>" + action.name + "</strong><small>" + (used ? "DONE" : action.cost + " TIME") + "</small></button>";
   }).join("");
-  document.querySelectorAll("[data-action-id]").forEach((button) => button.addEventListener("click", () => takeAction(button.dataset.actionId)));
+
+  document.querySelectorAll("[data-action-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const actionId = button.dataset.actionId;
+      const action = ACTIONS.find((item) => item.id === actionId);
+      if (!action) return;
+
+      const saved = await updateState((next) => {
+        if (next.actionUsed || next.actions.includes(actionId) || next.time < action.cost || next.status !== "playing") return false;
+        next.actions.push(actionId);
+        next.time -= action.cost;
+        next.trust = Math.max(0, Math.min(6, next.trust + action.trust));
+        next.actionUsed = true;
+        next.lastEvent = action.reveal;
+        if (next.round < 3) {
+          next.round += 1;
+          next.actionUsed = false;
+          next.lastEvent += " Round " + next.round + " is open.";
+        } else {
+          next.status = "final";
+        }
+      });
+
+      if (!saved) setBackendMessage("A teammate just logged a move. The updated case board is now shown.", "pending");
+    });
+  });
+
   const event = $("#event-card");
   event.classList.toggle("hidden", !state.lastEvent);
   event.textContent = state.lastEvent;
 }
 
-function takeAction(actionId) {
-  const action = ACTIONS.find((item) => item.id === actionId);
-  if (!action) return;
-  updateState((state) => {
-    if (state.actionUsed || state.actions.includes(actionId) || state.time < action.cost) return;
-    state.actions.push(actionId);
-    state.time -= action.cost;
-    state.trust = Math.max(0, Math.min(6, state.trust + action.trust));
-    state.actionUsed = true;
-    state.lastEvent = action.reveal;
-    if (state.round < 3) {
-      state.round += 1;
-      state.actionUsed = false;
-      state.lastEvent += ` Round ${state.round} is open.`;
-    } else {
-      state.status = "final";
-    }
-  });
-}
-
 function renderGame(state) {
-  const role = chosenRole();
-  $("#round-label").textContent = `ROUND ${state.round} OF 3`;
-  $("#clock-label").textContent = state.status === "final" ? "DECIDE" : `${Math.max(0, state.time)} UNITS`;
+  const role = chosenRole(state);
+  $("#round-label").textContent = "ROUND " + state.round + " OF 3";
+  $("#clock-label").textContent = state.status === "final" ? "DECIDE" : Math.max(0, state.time) + " UNITS";
   $("#time-value").textContent = state.time;
   $("#trust-value").textContent = state.trust;
   renderPrivateEvidence(state, role);
   renderSharedBoard(state);
   renderActions(state);
+
   const finalButton = $("#open-final");
   finalButton.disabled = state.status !== "final";
   $("#footer-message").textContent = state.status === "final"
@@ -259,29 +555,50 @@ function renderGame(state) {
 }
 
 function renderResult(state) {
-  const score = state.result?.score || 0;
+  const score = (state.result && state.result.score) || 0;
   $("#result-title").textContent = score >= 85 ? "A careful containment." : score >= 55 ? "A partial containment." : "The surge widened.";
-  $("#result-summary").textContent = state.result?.summary || "The case is resolved.";
+  $("#result-summary").textContent = (state.result && state.result.summary) || "The case is resolved.";
   $("#score-breakdown").innerHTML = [
-    [score, "total / 100"], [state.result?.decision || 0, "decision"], [state.result?.evidence || 0, "intel"], [state.result?.stewardship || 0, "stewardship"]
-  ].map(([value, label]) => `<div class="score-card"><strong>${value}</strong><span>${label}</span></div>`).join("");
-  $("#debrief-text").textContent = state.result?.debrief || "Review the case evidence and try again.";
+    [score, "total / 100"],
+    [(state.result && state.result.decision) || 0, "decision"],
+    [(state.result && state.result.evidence) || 0, "intel"],
+    [(state.result && state.result.stewardship) || 0, "stewardship"]
+  ].map(([value, label]) => '<div class="score-card"><strong>' + value + "</strong><span>" + label + "</span></div>").join("");
+  $("#debrief-text").textContent = (state.result && state.result.debrief) || "Review the case evidence and try again.";
 }
 
 function render() {
-  if (!roomCode) { showScreen("landing"); return; }
-  const state = readState();
-  if (!currentPlayer(state)) { showScreen("lobby"); renderLobby(state); return; }
-  if (state.status === "lobby") { showScreen("lobby"); renderLobby(state); }
-  if (state.status === "playing") { showScreen("game"); renderGame(state); }
-  if (state.status === "final") { showScreen("final"); }
-  if (state.status === "result") { showScreen("result"); renderResult(state); }
+  if (!backendReady || !roomCode || !roomState) {
+    showScreen("landing");
+    return;
+  }
+
+  const state = stateForRender();
+  if (!currentPlayer(state) || state.status === "lobby") {
+    showScreen("lobby");
+    renderLobby(state);
+    return;
+  }
+  if (state.status === "playing") {
+    showScreen("game");
+    renderGame(state);
+    return;
+  }
+  if (state.status === "final") {
+    showScreen("final");
+    return;
+  }
+  if (state.status === "result") {
+    showScreen("result");
+    renderResult(state);
+  }
 }
 
-function startCase() {
-  updateState((state) => {
-    const validPlayers = Object.values(state.players).filter((player) => ROLES.some((role) => role.id === player.roleId));
-    if (validPlayers.length < 2) return;
+async function startCase() {
+  const saved = await updateState((state) => {
+    if (state.status !== "lobby") return false;
+    const players = Object.values(state.players).filter((player) => ROLES.some((role) => role.id === player.roleId));
+    if (players.length < 2 || !state.players[playerId]) return false;
     state.status = "playing";
     state.round = 1;
     state.time = 6;
@@ -291,16 +608,27 @@ function startCase() {
     state.sharedEvidence = [];
     state.hypothesis = "";
     state.lastEvent = "";
+    delete state.result;
   });
+  if (!saved) setBackendMessage("Two teammates with different roles are needed before the case can start.", "pending");
 }
 
-function saveHypothesis() { updateState((state) => { state.hypothesis = $("#hypothesis").value.trim(); }); }
+async function saveHypothesis() {
+  const hypothesis = $("#hypothesis").value.trim();
+  const saved = await updateState((state) => {
+    if (state.status !== "playing") return false;
+    state.hypothesis = hypothesis;
+  });
+  if (!saved) setBackendMessage("The case phase changed before that theory could be saved.", "pending");
+}
 
-function submitFinal(form) {
+async function submitFinal(form) {
   const data = new FormData(form);
   const correct = data.get("source") === "food" && data.get("pattern") === "common" && data.get("response") === "close";
   const partial = [data.get("source") === "food", data.get("pattern") === "common", data.get("response") === "close"].filter(Boolean).length;
-  updateState((state) => {
+
+  const saved = await updateState((state) => {
+    if (state.status !== "final") return false;
     const evidence = Math.min(30, state.sharedEvidence.length * 3);
     const stewardship = Math.max(0, Math.min(30, 12 + state.time * 4 + state.trust));
     const decision = correct ? 40 : partial * 12;
@@ -319,51 +647,95 @@ function submitFinal(form) {
         : "The evidence favored a localized foodborne common exposure at Food Lane C, not airborne spread or a citywide water failure. Share more role-specific evidence and avoid costly broad actions next time."
     };
   });
+  if (!saved) setBackendMessage("The final decision was already submitted by a teammate.", "pending");
 }
 
-function resetCase() {
-  updateState((state) => {
-    Object.assign(state, initialState(), { players: state.players });
+async function resetCase() {
+  await updateState((state) => {
+    if (state.status !== "result") return false;
+    const players = state.players;
+    Object.assign(state, initialState(), { players });
   });
 }
 
-$("#host-case").addEventListener("click", () => {
-  leaveRoom();
-  joinRoom(makeRoomCode(), "");
-  showScreen("lobby");
+$("#host-case").addEventListener("click", async () => {
+  if (!await ensureBackend()) return;
+  try {
+    await leaveRoom();
+    const code = await createRoom();
+    await connectToRoom(code);
+    showScreen("lobby");
+  } catch (error) {
+    console.error(error);
+    setBackendMessage("We could not host a case. Try again in a moment.", "error");
+  }
 });
-$("#join-form").addEventListener("submit", (event) => {
+
+$("#join-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const suppliedCode = $("#join-code").value.trim().toUpperCase();
-  const code = /^D7-\d{4}$/.test(suppliedCode) ? suppliedCode : "";
+  if (!await ensureBackend()) return;
+
   const field = $("#join-code");
+  const code = normalizeRoomCode(field.value);
   if (!code) {
-    field.setCustomValidity("Enter a room code in the format D7-1234.");
+    field.setCustomValidity("Enter a room code in the format D7-ABC123.");
     field.reportValidity();
     return;
   }
   field.setCustomValidity("");
-  leaveRoom();
-  joinRoom(code, "");
-  showScreen("lobby");
+
+  try {
+    const snapshot = await get(ref(database, roomPath(code)));
+    if (!snapshot.exists()) {
+      field.setCustomValidity("We could not find that case. Check the invite and try again.");
+      field.reportValidity();
+      return;
+    }
+    await leaveRoom();
+    await connectToRoom(code);
+    showScreen("lobby");
+  } catch (error) {
+    console.error(error);
+    setBackendMessage("We could not join that room. Check your connection and try again.", "error");
+  }
 });
+
 $("#how-to-play").addEventListener("click", () => $("#how-dialog").showModal());
 $("#open-objective").addEventListener("click", () => $("#objective-dialog").showModal());
-document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => $(`#${button.dataset.closeDialog}`).close()));
+document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => $("#" + button.dataset.closeDialog).close()));
 $("#copy-room").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText(roomCode); $("#copy-room").textContent = "Copied"; setTimeout(() => { $("#copy-room").textContent = "Copy code"; }, 1400); } catch { $("#copy-room").textContent = roomCode; }
+  const invite = "Join my Data Detective: Outbreak case\n" + inviteLink() + "\nRoom code: " + roomCode;
+  try {
+    await navigator.clipboard.writeText(invite);
+    $("#copy-room").textContent = "Invite copied";
+    setTimeout(() => { $("#copy-room").textContent = "Copy invite"; }, 1400);
+  } catch {
+    $("#copy-room").textContent = roomCode;
+  }
 });
 $("#start-case").addEventListener("click", startCase);
 $("#save-hypothesis").addEventListener("click", saveHypothesis);
-$("#open-final").addEventListener("click", () => updateState((state) => { state.status = "final"; }));
-$("#final-form").addEventListener("submit", (event) => { event.preventDefault(); submitFinal(event.currentTarget); });
+$("#open-final").addEventListener("click", async () => {
+  const saved = await updateState((state) => {
+    if (state.status !== "final") return false;
+  });
+  if (!saved) setBackendMessage("The team still has investigation moves available.", "pending");
+});
+$("#final-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitFinal(event.currentTarget);
+});
 $("#play-again").addEventListener("click", resetCase);
-document.querySelectorAll("[data-action=return-home]").forEach((button) => button.addEventListener("click", () => { leaveRoom(); showScreen("landing"); }));
-window.addEventListener("storage", (event) => { if (event.key === stateKey()) render(); });
+document.querySelectorAll("[data-action=return-home]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    await leaveRoom();
+    showScreen("landing");
+  });
+});
 
-if (roomCode) {
-  channel = new BroadcastChannel(`${STORAGE_PREFIX}${roomCode}`);
-  channel.onmessage = () => render();
+const invitedRoom = normalizeRoomCode(new URLSearchParams(window.location.search).get("room"));
+if (invitedRoom && !roomCode) {
+  $("#join-code").value = invitedRoom;
 }
-render();
 
+startupPromise = initialiseBackend();

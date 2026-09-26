@@ -38,10 +38,11 @@
           <div class="hero-actions">
             <button class="button button-primary" id="host-case">Host a case <span>→</span></button>
             <form id="join-form" class="join-form">
-              <input id="join-code" aria-label="Room code" autocomplete="off" maxlength="7" placeholder="Room code" />
+              <input id="join-code" aria-label="Room code" autocomplete="off" maxlength="9" placeholder="D7-ABC123" />
               <button class="button button-secondary" type="submit">Join case</button>
             </form>
           </div>
+          <p id="backend-message" class="backend-message" role="status"></p>
           <button class="text-button how-link" id="how-to-play">How it works</button>
           <div class="score-pill-row" aria-label="Game principles">
             <span>PRIVATE EVIDENCE</span><span>SHARED DECISIONS</span><span>ONE FINAL CALL</span>
@@ -72,9 +73,9 @@
           <button class="text-button" data-action="return-home">← Back home</button>
         </div>
         <div class="room-banner">
-          <div><span>ROOM CODE</span><strong id="room-code">D7-0000</strong></div>
-          <p>Open this game in another tab, choose the same code, and select a different role.</p>
-          <button class="button button-small" id="copy-room">Copy code</button>
+          <div><span>ROOM CODE</span><strong id="room-code">D7-ABC123</strong></div>
+          <p>Share this invite with teammates. They can join the same case from any device and choose a different role.</p>
+          <button class="button button-small" id="copy-room">Copy invite</button>
         </div>
         <div class="lobby-layout">
           <div>
@@ -156,9 +157,9 @@
       </section>
     </main>
 
-    <dialog id="how-dialog" class="modal"><button class="modal-close" data-close-dialog="how-dialog">×</button><p class="eyebrow">HOW TO PLAY</p><h2>Everyone sees part of the picture.</h2><ol><li>Join a room in separate browser tabs and take different roles.</li><li>Read your private clues. Reveal the details worth sharing.</li><li>Agree on three investigation moves, then make one final call.</li></ol></dialog>
+    <dialog id="how-dialog" class="modal"><button class="modal-close" data-close-dialog="how-dialog">×</button><p class="eyebrow">HOW TO PLAY</p><h2>Everyone sees part of the picture.</h2><ol><li>Join the same room from separate devices and take different roles.</li><li>Read your private clues. Reveal the details worth sharing.</li><li>Agree on three investigation moves, then make one final call.</li></ol></dialog>
     <dialog id="objective-dialog" class="modal"><button class="modal-close" data-close-dialog="objective-dialog">×</button><p class="eyebrow">CASE OBJECTIVE</p><h2>Prevent a larger surge.</h2><p>Correctly identify the source and case pattern, then select the most proportional first response. High trust and unused time improve the final score.</p></dialog>
-    <script src="app.js"></script>
+    <script type="module" src="app.js"></script>
   </body>
 </html>
 
